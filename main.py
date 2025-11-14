@@ -18,6 +18,7 @@ import glob
 
 # torch
 import torch
+import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.optim as optim
@@ -25,29 +26,11 @@ import yaml
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
-from torchlight import DictAction
+from torchlight.torchlight import DictAction
 
 
-# 假设 D 是 clip 生成的 embedding 维度，比如 512
-# 加载 NPZ 文件并查看键名
-npz_file = np.load("view/ntu120_semantic_graphs_focus.npz")
-# print(f"NPZ 文件中的键: {list(npz_file.keys())}")
-# 创建特征矩阵，收集所有类别的特征向量
-feature_keys = list(npz_file.keys())  # 获取所有类别名称
-num_classes = len(feature_keys)  # 类别数量（应为 120）
-first_key = feature_keys[0]  # 获取第一个键名
-matrix_shape = npz_file[first_key].shape  # 获取矩阵形状
-semantic_matrices = np.zeros((num_classes, matrix_shape[0], matrix_shape[1]))
-# 按顺序填充特征矩阵
-for i, key in enumerate(feature_keys):
-    semantic_matrices[i] = npz_file[key]
-npz_file.close()  # 关闭文件
+from model.Graph_fusion import SPD_Fusion
 
-
-
-# import resource
-# rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
-# resource.setrlimit(resource.RLIMIT_NOFILE, (2048, rlimit[1]))
 
 def init_seed(seed):
     torch.cuda.manual_seed_all(seed)
@@ -87,7 +70,7 @@ def get_parser():
     parser.add_argument('-model_saved_name', default='')
     parser.add_argument(
         '--config',
-        default='./config/nturgbd-cross-view/test_bone.yaml',
+        default='config/nturgbd120-cross-subject/default.yaml',
         help='path to the configuration file')
 
     # processor
@@ -160,6 +143,13 @@ def get_parser():
         action=DictAction,
         default=dict(),
         help='the arguments of model')
+
+    parser.add_argument(
+        '--spd_args',
+        action=DictAction,
+        default=dict(),
+        help='the arguments of model')
+
     parser.add_argument(
         '--weights',
         default=None,
@@ -219,7 +209,7 @@ def get_parser():
 
 
 class Processor():
-    """ 
+    """
         Processor for Skeleton-based Action Recgnition
     """
 
@@ -243,7 +233,15 @@ class Processor():
             else:
                 self.train_writer = self.val_writer = SummaryWriter(os.path.join(arg.model_saved_name, 'test'), 'test')
         self.global_step = 0
-        # pdb.set_trace()
+
+
+        sem_A = torch.load('/dadaY/xinyu/pycharmproject/CTR-GCN-main/llm/semantic_feature/sem_A_joint.pt')
+        self.sem_A = torch.tensor(sem_A).float()
+        print('Extract CLIP Semantics Successful!')
+
+        self.GraphFuser = SPD_Fusion(**self.arg.spd_args)
+
+
         self.load_model()
 
         if self.arg.phase == 'model_size':
@@ -256,6 +254,7 @@ class Processor():
         self.best_acc_epoch = 0
 
         self.model = self.model.cuda(self.output_device)
+        self.GraphFuser = self.GraphFuser.cuda(self.output_device)
 
         if type(self.arg.device) is list:
             if len(self.arg.device) > 1:
@@ -393,11 +392,14 @@ class Processor():
         self.adjust_learning_rate(epoch)
 
         loss_value = []
-        acc_value = []
+        acc_value = [] # 准确率列表
         self.train_writer.add_scalar('epoch', epoch, self.global_step)
         self.record_time()
         timer = dict(dataloader=0.001, model=0.001, statistics=0.001)
         process = tqdm(loader, ncols=40)
+
+        self.sem_A = self.sem_A.cuda(self.output_device)
+
 
         for batch_idx, (data, label, index) in enumerate(process):
             self.global_step += 1
@@ -406,23 +408,36 @@ class Processor():
                 label = label.long().cuda(self.output_device)
             timer['dataloader'] += self.split_time()
 
-            # forward
-            output, graph = self.model(data)
+            #第一阶段：获取 coarse logits
+            output1 = self.model(data, A_sem=None)  # (N, n)
+            logits = F.softmax(output1, dim=1)  # (N, 120)
 
-            #todo 引入clip生成的graph
+            # 生成语义图
+            A_sem =  self.GraphFuser(logits, self.sem_A)   #graph:N,V,V
 
 
+            # 冻结/解冻参数进行两阶段训练
+            for param in self.model.parameters():
+                param.requires_grad = False
 
-            loss = self.loss(output, label)
+            output2 = self.model(data, A_sem=A_sem)  # (N, 120)
+
+            for param in self.model.parameters():
+                param.requires_grad = True
+
+            loss1 = self.loss(output1, label)
+            loss2 = self.loss(output2, label)
+
+            loss = loss1 +  loss2
+
             # backward
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-
             loss_value.append(loss.data.item())
             timer['model'] += self.split_time()
 
-            value, predict_label = torch.max(output.data, 1)
+            value, predict_label = torch.max(output2.data, 1)
             acc = torch.mean((predict_label == label.data).float())
             acc_value.append(acc.data.item())
             self.train_writer.add_scalar('acc', acc, self.global_step)
@@ -439,7 +454,7 @@ class Processor():
             for k, v in timer.items()
         }
         self.print_log(
-            '\tMean training loss: {:.4f}.  Mean training acc: {:.2f}%.'.format(np.mean(loss_value), np.mean(acc_value)*100))
+            '\tMean training loss: {:.4f}.  Mean training acc: {:.2f}%.'.format(np.mean(loss_value), np.mean(acc_value)*100)) # 输出平均损失和准确率
         self.print_log('\tTime consumption: [Data]{dataloader}, [Network]{model}'.format(**proportion))
 
         if save_model:
@@ -462,13 +477,23 @@ class Processor():
             pred_list = []
             step = 0
             process = tqdm(self.data_loader[ln], ncols=40)
+
+            self.sem_A = self.sem_A.cuda(self.output_device)
+
             for batch_idx, (data, label, index) in enumerate(process):
                 label_list.append(label)
                 with torch.no_grad():
                     data = data.float().cuda(self.output_device)
                     label = label.long().cuda(self.output_device)
-                    output = self.model(data)
-                    loss = self.loss(output, label)
+                    output1 = self.model(data, A_sem=None)  # (N, 120)
+                    probs = F.softmax(output1, dim=1)  # (N, 120)
+                    A_sem = self.GraphFuser(probs,self.sem_A)   #graph:N,V,V
+                    output = self.model(data, A_sem=A_sem)  # (N, 120)
+
+                    loss1 = self.loss(output1, label)
+                    loss2 = self.loss(output, label)
+                    loss = loss1 + loss2
+
                     score_frag.append(output.data.cpu().numpy())
                     loss_value.append(loss.data.item())
 
@@ -534,7 +559,7 @@ class Processor():
                 save_model = (((epoch + 1) % self.arg.save_interval == 0) or (
                         epoch + 1 == self.arg.num_epoch)) and (epoch+1) > self.arg.save_epoch
 
-                self.train(epoch, save_model=save_model)
+                self.train(epoch, save_model=save_model) #特定epoch保存模型
 
                 self.eval(epoch, save_score=self.arg.save_score, loader_name=['test'])
 
